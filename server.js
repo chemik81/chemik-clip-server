@@ -12,7 +12,8 @@
  */
 const http = require('http'), fs = require('fs'), fsp = fs.promises, path = require('path'), os = require('os'), { spawn } = require('child_process');
 const PORT = process.env.PORT || 8080, SECRET = process.env.WORKER_SECRET || '';
-const GKEYS = [process.env.GEMINI_FREE_KEY, ...(process.env.GEMINI_API_KEY || '').split(',')].map(s => String(s || '').trim()).filter(Boolean) // jak w bocie: najpierw darmowy, potem płatny, MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GKEYS = [process.env.GEMINI_FREE_KEY, ...(process.env.GEMINI_API_KEY || '').split(',')].map(s => String(s || '').trim()).filter(Boolean); // jak w bocie: najpierw darmowy, potem płatny
+const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const FONT = process.env.FONT || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -34,7 +35,7 @@ const localPath = u => u.replace(/^file:\/\//, '');
 async function getSegment(url, from, to, out) {
   if (isLocal(url)) return run('ffmpeg', ['-y', '-ss', String(from), '-to', String(to), '-i', localPath(url), '-vf', 'scale=-2:720', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-c:a', 'aac', '-ar', '44100', '-ac', '2', out]);
   const tmp = out.replace(/\.mp4$/, '.dl');
-  await run('yt-dlp', ['-q', '--no-warnings', '-f', 'best[height<=720]/best', '--download-sections', `*${hms(from)}-${hms(to)}`, '--concurrent-fragments', '4', '-o', tmp + '.%(ext)s', url], { timeout: 6 * 60e3 });
+  await run('yt-dlp', ['-q', '--no-warnings', '-f', 'bv*[height<=720]+ba/b[height<=720]/best', '--merge-output-format', 'mp4', '--download-sections', `*${hms(from)}-${hms(to)}`, '--concurrent-fragments', '4', '-o', tmp + '.%(ext)s', url], { timeout: 6 * 60e3 });
   const f = (await fsp.readdir(path.dirname(out))).find(x => x.startsWith(path.basename(tmp) + '.'));
   if (!f) throw new Error('segment not downloaded');
   await run('ffmpeg', ['-y', '-i', path.join(path.dirname(out), f), '-vf', 'scale=-2:720', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-c:a', 'aac', '-ar', '44100', '-ac', '2', out]);
@@ -120,7 +121,7 @@ async function processJob(job, opts = {}) {
       const off = ms => (ms - s.created) / 1000, vodLen = (s.dur || 4 * 36e5) / 1000;
       const from = Math.max(0, off(job.start) - 300), to = Math.min(vodLen, from + gameLen);
       if (to - from < 120) continue; stats.streams++;
-      log(`[${job.scheduleId}] ${s.login}: okno ${hms(from)}–${hms(to)}`);
+      progress(job, `${pl ? '🔊 Pobieram dźwięk i szukam głośnych momentów' : '🔊 Downloading audio, looking for loud moments'} (${hms(from)}–${hms(to)})`);
       // kandydaci: kliknięcia kibiców (akcja chwilę PRZED kliknięciem), klipy, skoki głośności
       const C = [];
       (job.presses || []).forEach(t => C.push({ t: off(t) - 7, w: 3 }));
@@ -129,6 +130,7 @@ async function processJob(job, opts = {}) {
       const M = []; C.filter(c => c.t > from && c.t < to).sort((a, b) => a.t - b.t).forEach(c => { const l = M[M.length - 1]; if (l && c.t - l.t < 15) { l.w += c.w; if (c.w > l.top) { l.t = c.t; l.top = c.w; } } else M.push({ ...c, top: c.w }); });
       const pick = M.sort((a, b) => b.w - a.w).slice(0, opts.maxCand || (job.streams.length > 1 ? 10 : 14)); stats.candidates += pick.length;
       for (const [ci, c] of pick.entries()) {
+        progress(job, `${pl ? '🎬 Fragment' : '🎬 Clip'} ${ci + 1}/${pick.length}: ${pl ? 'pobieram i oceniam (Gemini)' : 'downloading and rating (Gemini)'}`);
         const seg = path.join(dir, `seg${si}_${ci}.mp4`), a = Math.max(0, c.t - 16), b = Math.min(vodLen, c.t + 8);
         try { await getSegment(s.url, a, b, seg); } catch (e) { log('segment:', e.message); continue; }
         const seglen = await probeDur(seg); let j = await judge(seg, job); if (j) stats.judged++;
@@ -142,6 +144,7 @@ async function processJob(job, opts = {}) {
     let best = uniq.filter(p => p.score >= 6); if (best.length < 4) best = uniq.filter(p => p.score >= 4);
     best = best.slice(0, opts.maxPlays || 8).sort((x, y) => x.abs - y.abs);
     if (best.length < 3) throw new Error(pl ? `za mało dobrych akcji (${best.length})` : `not enough good plays (${best.length})`);
+    progress(job, `${pl ? '✂️ Montaż skrótu' : '✂️ Editing the reel'} (${best.length} ${pl ? 'akcji' : 'plays'})`);
     const score = (job.games || []).map(g => `${g.s1} : ${g.s2}`).join('   ·   ');
     const top = `${job.team1} vs ${job.team2}${job.week ? `  ·  WEEK ${job.week}` : ''}`;
     const parts = [await card(dir, 'intro', [[brand, 30, '0xf5c518'], [`${job.team1}  vs  ${job.team2}`, 54], ...(score ? [[score, 44]] : []), [`${job.week ? `WEEK ${job.week}  ·  ` : ''}HIGHLIGHTS`, 26, '0x9aa4bf']], 3)];
@@ -150,6 +153,7 @@ async function processJob(job, opts = {}) {
     const wide = await concat(dir, parts, path.join(dir, 'wide.mp4')), vert = await vertical(wide, path.join(dir, 'vertical.mp4'));
     const result = { ok: true, scheduleId: job.scheduleId, plays: best.map(p => ({ caption: p.caption, player: p.player, type: p.type, score: Math.round(p.score * 10) / 10, team: p.team, at: new Date(p.abs).toISOString() })), stats: { ...stats, seconds: Math.round((Date.now() - t0) / 1000), length: Math.round(await probeDur(wide)) } };
     if (opts.keep) return { ...result, files: { wide, vertical: vert }, dir };
+    progress(job, pl ? '📤 Wysyłam pliki' : '📤 Uploading files');
     for (const [kind, f] of [['wide', wide], ['vertical', vert]]) {
       const r = await fetch(`${job.callback}/highlights/upload?sid=${encodeURIComponent(job.scheduleId)}&kind=${kind}`, { method: 'POST', headers: { 'X-Webhook-Secret': SECRET, 'Content-Type': 'video/mp4' }, body: await fsp.readFile(f) });
       if (!r.ok) throw new Error(`upload ${kind}: ${r.status} ${(await r.text()).slice(0, 200)}`);
@@ -160,11 +164,12 @@ async function processJob(job, opts = {}) {
     if (!opts.keep) await report(job, { ok: false, scheduleId: job.scheduleId, error: e.message, stats }); else throw e;
   } finally { if (!opts.keep) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); }
 }
+function progress(job, text) { if (!job.callback || /^http:\/\/x$/.test(job.callback)) return; fetch(`${job.callback}/highlights/progress`, { method: 'POST', headers: { 'X-Webhook-Secret': SECRET, 'Content-Type': 'application/json' }, body: JSON.stringify({ scheduleId: job.scheduleId, text }) }).catch(() => {}); log(`[${job.scheduleId}] ${text}`); }
 async function report(job, body) { await fetch(`${job.callback}/highlights/done`, { method: 'POST', headers: { 'X-Webhook-Secret': SECRET, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(e => log('report:', e.message)); }
 
 // ── kolejka i HTTP ──────────────────────────────────────────────
 const queue = []; let current = null;
-async function pump() { if (current || !queue.length) return; current = queue.shift(); log(`▶ ${current.scheduleId} ${current.team1} vs ${current.team2}`);
+async function pump() { if (current || !queue.length) return; current = queue.shift(); progress(current, current.lang === 'pl' ? '▶ Start' : '▶ Started');
   try { await processJob(current); } catch (e) { log('job:', e.message); } current = null; setImmediate(pump); }
 if (require.main === module) {
   http.createServer((req, res) => {
@@ -182,4 +187,4 @@ if (require.main === module) {
     J(404, { error: 'not found' });
   }).listen(PORT, () => log(`🎞️ clip server :${PORT} · gemini ${GKEYS.length ? 'on' : 'OFF'}`));
 }
-module.exports = { processJob, audioPeaks, loudness };
+module.exports = { processJob, audioPeaks, loudness, judge };
