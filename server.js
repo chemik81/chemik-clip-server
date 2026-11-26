@@ -6,12 +6,13 @@
  *
  * Zmienne środowiskowe (Railway → Variables):
  *   WORKER_SECRET   — ta sama wartość co DISCORD_WEBHOOK_SECRET w Workerach (i WORKER_SECRET bota)
- *   GEMINI_API_KEY  — klucz Gemini (można kilka po przecinku)
+ *   GEMINI_FREE_KEY — darmowy klucz Gemini (używany najpierw, jak w bocie)
+ *   GEMINI_API_KEY  — płatny klucz Gemini (zapasowy)
  *   GEMINI_MODEL    — opcjonalnie, domyślnie gemini-2.5-flash
  */
 const http = require('http'), fs = require('fs'), fsp = fs.promises, path = require('path'), os = require('os'), { spawn } = require('child_process');
 const PORT = process.env.PORT || 8080, SECRET = process.env.WORKER_SECRET || '';
-const GKEYS = (process.env.GEMINI_API_KEY || '').split(',').map(s => s.trim()).filter(Boolean), MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GKEYS = [process.env.GEMINI_FREE_KEY, ...(process.env.GEMINI_API_KEY || '').split(',')].map(s => String(s || '').trim()).filter(Boolean) // jak w bocie: najpierw darmowy, potem płatny, MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const FONT = process.env.FONT || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
