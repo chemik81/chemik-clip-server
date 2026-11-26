@@ -13,7 +13,19 @@
 const http = require('http'), fs = require('fs'), fsp = fs.promises, path = require('path'), os = require('os'), { spawn } = require('child_process');
 const PORT = process.env.PORT || 8080, SECRET = process.env.WORKER_SECRET || '';
 const GKEYS = [process.env.GEMINI_FREE_KEY, ...(process.env.GEMINI_API_KEY || '').split(',')].map(s => String(s || '').trim()).filter(Boolean); // jak w bocie: najpierw darmowy, potem płatny
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+let MODEL = process.env.GEMINI_MODEL || null, _modelAt = 0; // bez GEMINI_MODEL: najnowszy „flash” z listy modeli Google (stare modele znikają)
+async function pickModel(force) {
+  if (process.env.GEMINI_MODEL) return process.env.GEMINI_MODEL;
+  if (MODEL && !force && Date.now() - _modelAt < 12 * 3600e3) return MODEL;
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${GKEYS[0]}`, { signal: AbortSignal.timeout(15e3) });
+    const list = ((await r.json()).models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name.replace(/^models\//, ''));
+    const ver = n => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+    const flash = list.filter(n => /^gemini-[\d.]+-flash/.test(n) && !/lite|image|tts|live|audio|native|thinking/.test(n)).sort((a, b) => ver(b) - ver(a) || (/preview|exp/.test(a) ? 1 : 0) - (/preview|exp/.test(b) ? 1 : 0));
+    if (flash[0]) { MODEL = flash[0]; _modelAt = Date.now(); log('gemini model:', MODEL); return MODEL; }
+  } catch (e) { log('models:', e.message); }
+  return MODEL || 'gemini-flash-latest';
+}
 const FONT = process.env.FONT || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -72,11 +84,14 @@ async function judge(file, ctx) {
   const prompt = `This is a ~24 second clip from a stream of an NBA 2K Pro-Am game (${ctx.team1} vs ${ctx.team2}). The camera follows one player. Voices on the stream are the players' team voice chat and may be in ANY language (Polish, Finnish, Turkish, Romanian, English…) — loud excited voices are a hint that something big happened, but judge mainly by what you SEE.
 Rate how highlight-worthy the best play in the clip is, 0–10: 9–10 = poster dunk, game winner, buzzer beater, ankle breaker + score, chase-down block; 7–8 = clean dunk, deep/contested three, alley-oop, great block or steal + fast break, and-one; 4–6 = ordinary made basket or nice pass; 0–3 = nothing, menus, replays, loading screens, free throws, dead ball, timeouts.
 Reply with JSON only: {"score": number, "type": "dunk|three|block|steal|alleyoop|layup|assist|other|none", "caption": "${ctx.lang === 'pl' ? 'krótki podpis akcji po polsku, max 55 znaków, bez emoji' : 'short caption of the play in English, max 55 chars, no emoji'}", "player": "gamertag of the player who made the play if readable on screen, else null", "start": seconds, "end": seconds} — start/end = the best 6–13 s within the clip: include the build-up and the finish, end right after the ball goes in or the play ends.`;
-  for (const key of GKEYS) {
+  let model = await pickModel();
+  for (let ki = 0; ki < GKEYS.length; ki++) { const key = GKEYS[ki];
     try {
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: [{ parts: [{ inline_data: { mime_type: 'video/mp4', data } }, { text: prompt }] }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } }), signal: AbortSignal.timeout(90e3) });
-      if (!r.ok) { log('gemini', r.status, (await r.text()).slice(0, 200)); continue; }
+      if (!r.ok) { const t = await r.text(); log('gemini', r.status, model, t.slice(0, 160).replace(/\s+/g, ' '));
+        if (r.status === 404) { const sug = (t.match(/use models\/([\w.-]+)/) || [])[1]; const nm = process.env.GEMINI_MODEL ? null : (sug || await pickModel(true)); if (nm && nm !== model) { model = MODEL = nm; _modelAt = Date.now(); ki--; } } // model wycofany → nowy i ten sam klucz jeszcze raz
+        continue; }
       const j = await r.json(), txt = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
       const o = JSON.parse(txt.replace(/^```json|```$/g, '').trim()); return { score: +o.score || 0, type: o.type || 'other', caption: String(o.caption || '').slice(0, 60), player: o.player && o.player !== 'null' ? String(o.player).slice(0, 30) : null, start: +o.start || 0, end: +o.end || 0 };
     } catch (e) { log('gemini err', e.message); }
