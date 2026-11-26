@@ -1,0 +1,9 @@
+{
+  "name": "chemik-clip-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Automatyczne skróty meczów z VOD (yt-dlp + ffmpeg + Gemini)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" }
+}
