@@ -195,6 +195,19 @@ async function boxCard(dir, box, job, secs) { // 📊 tabela statystyk z danych 
   await run('ffmpeg', ['-y', '-f', 'lavfi', '-i', `color=c=0x0b1020:s=1280x720:d=${secs}:r=30`, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', String(secs), '-vf', `drawbox=x=640:y=95:w=2:h=520:color=0x334155:t=fill,${vf.join(',')},fade=t=in:st=0:d=0.4,fade=t=out:st=${secs - 0.4}:d=0.4`, ...V, '-shortest', out]);
   return out;
 }
+// 📊 ekran statystyk z nagrania: Gemini wskazuje klatkę, na której tabela jest najczytelniejsza → stop-klatka na 4,5 s (nawet gdy w grze była widoczna tylko chwilę)
+async function boxFreeze(dir, at, job) {
+  const seg = path.join(dir, 'boxseg.mp4'), a = Math.max(0, at.t - 12); await getSegment(at.url, a, Math.min(at.vodLen, at.t + 15), seg);
+  const d = await probeDur(seg); if (d < 2) return null;
+  let t = Math.min(d - 0.2, at.t - a + 1);
+  if (GKEYS.length) { const small = path.join(dir, 'boxseg.ai.mp4'); await run('ffmpeg', ['-y', '-v', 'error', '-i', seg, '-vf', 'scale=-2:480,fps=4', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-an', small]).catch(() => {});
+    const r = await gemGenerate([{ inline_data: { mime_type: 'video/mp4', data: (await fsp.readFile(fs.existsSync(small) ? small : seg)).toString('base64') } }, { text: `This ~${Math.round(d)} s clip from an NBA 2K game stream should show the FINAL box score / end-of-game player stats table. Reply with JSON only: {"found": true|false, "time": seconds} — time = the moment where the stats table is fully visible, sharp and NOT covered by menus or transitions (if it appears several times, pick the most complete view).` }], { timeout: 45e3, budget: 90e3 });
+    const o = r && parseJson(r); if (o && o.found === false) return null; if (o && isFinite(+o.time)) t = Math.max(0, Math.min(d - 0.1, +o.time)); }
+  const png = path.join(dir, 'box.png'); await run('ffmpeg', ['-y', '-v', 'error', '-ss', t.toFixed(2), '-i', seg, '-frames:v', '1', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2', png]);
+  const out = path.join(dir, 'boxfreeze.mp4'), secs = 4.5;
+  await run('ffmpeg', ['-y', '-loop', '1', '-i', png, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', String(secs), '-vf', `zoompan=z='min(zoom+0.0006,1.04)':d=${Math.round(secs * 30)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1280x720:fps=30,fade=t=in:st=0:d=0.3,fade=t=out:st=${secs - 0.3}:d=0.3`, ...V, '-shortest', out]);
+  return out;
+}
 async function concat(dir, files, out) { const lst = path.join(dir, path.basename(out) + '.txt'); await fsp.writeFile(lst, files.map(f => `file '${f}'`).join('\n')); await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', '-movflags', '+faststart', out]); return out; }
 async function vertical(wide, out) {
   await run('ffmpeg', ['-y', '-i', wide, '-filter_complex', '[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=20:4[bg];[0:v]scale=720:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart', out]);
@@ -250,8 +263,7 @@ async function processJob(job, opts = {}) {
     for (const [i, p] of best.entries()) parts.push(await part(dir, i, p.seg, p.a, p.b, `${p.caption}${p.player && !p.caption.toLowerCase().includes(p.player.toLowerCase()) ? '  —  ' + p.player : ''}`, top));
     progress(job, pl ? '📊 Tabela statystyk na koniec' : '📊 Box score at the end');
     let boxPart = null;
-    if (boxAt) try { const seg = path.join(dir, 'boxseg.mp4'), a = Math.max(0, boxAt.t - 0.5); await getSegment(boxAt.url, a, Math.min(boxAt.vodLen, a + 5), seg);
-      const d = await probeDur(seg); if (d >= 3) boxPart = await part(dir, 'box', seg, 0, Math.min(4.5, d), '', top); /* ekran statystyk z gry — bez paska z podpisem */ } catch (e) { log('box:', e.message); }
+    if (boxAt) try { boxPart = await boxFreeze(dir, boxAt, job); } catch (e) { log('box:', e.message); }
     if (!boxPart && (job.box || []).length) boxPart = await boxCard(dir, job.box[job.box.length - 1], job, 5).catch(e => { log('boxcard:', e.message); return null; });
     if (boxPart) parts.push(boxPart);
     parts.push(await card(dir, 'outro', [[brand, 34, '0xf5c518'], [site, 28]], 2.5));
