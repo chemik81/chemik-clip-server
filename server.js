@@ -26,25 +26,40 @@ async function modelList(force) {
   _models = [...new Set([process.env.GEMINI_MODEL, ...flash, 'gemini-flash-latest'].filter(Boolean))]; _modelsAt = Date.now(); log('gemini models:', _models.slice(0, 4).join(', '));
   return _models;
 }
-// jedno zapytanie do Gemini z ponawianiem: przeciążenie (503/429/timeout) → chwila przerwy, kolejny klucz, starszy model
+// jedno zapytanie do Gemini: przeciążony model (503/timeout) → na 20 min schodzi na koniec kolejki; klucz bez limitu (429) → pomijany przez godzinę
+const _cool = {}; const cool = (k, ms) => { _cool[k] = Date.now() + ms; }, hot = k => (_cool[k] || 0) > Date.now();
 async function gemGenerate(parts, { keys = GKEYS, timeout = 60e3, budget = 180e3, cfg = {} } = {}) {
   const t0 = Date.now(); let models = await modelList();
-  for (let mi = 0; mi < Math.min(3, models.length); mi++) { const model = models[mi];
-    for (const key of keys) for (let att = 0; att < 2; att++) {
+  const order = () => [...models.slice(0, 4).filter(m => !hot('m:' + m)), ...models.slice(0, 4).filter(m => hot('m:' + m))];
+  const ks = () => { const ok = keys.filter(k => !hot('k:' + k)); return ok.length ? ok : keys; };
+  for (const model of order()) {
+    for (const key of ks()) {
       if (Date.now() - t0 > budget) return null;
       try {
         const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: [{ parts }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json', ...cfg } }), signal: AbortSignal.timeout(timeout) });
-        if (r.ok) { const j = await r.json(); const t = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''); if (t) return t; break; }
-        const body = (await r.text()).slice(0, 160).replace(/\s+/g, ' '); log('gemini', r.status, model, body);
+        if (r.ok) { const j = await r.json(); const t = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''); if (t) return t; continue; }
+        const body = (await r.text()).slice(0, 120).replace(/\s+/g, ' '); log('gemini', r.status, model, key === process.env.GEMINI_FREE_KEY ? '(free)' : '(paid)', body);
         if (r.status === 404) { models = await modelList(true); break; }
-        if ([429, 500, 503].includes(r.status) && att === 0) { await new Promise(x => setTimeout(x, 5000)); continue; }
-        break;
-      } catch (e) { log('gemini err', model, e.message); break; }
+        if (r.status === 429) { cool('k:' + key, 60 * 60e3); continue; }        // limit klucza → następny klucz
+        if (r.status === 503 || r.status === 500) { cool('m:' + model, 20 * 60e3); break; } // przeciążony model → następny model
+      } catch (e) { log('gemini err', model, e.message); cool('m:' + model, 20 * 60e3); break; }
     }
   }
   return null;
 }
+// 🏷️ nick z obrazu → najbliższy nick z prawdziwego składu (statystyki meczu + składy drużyn)
+const _nn = x => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+function _lev(a, b) { const d = Array.from({ length: a.length + 1 }, (_, i) => [i]); for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); return d[a.length][b.length]; }
+function matchName(raw, roster) {
+  const r = _nn(raw); if (!r || !(roster || []).length) return roster?.length ? null : (raw || null);
+  let best = null, bs = 0;
+  for (const n of roster) { const k = _nn(n); if (!k) continue; let sc = k === r ? 1 : (k.includes(r) || r.includes(k)) && Math.min(k.length, r.length) >= 3 ? 0.85 : 1 - _lev(k, r) / Math.max(k.length, r.length); if (sc > bs) { bs = sc; best = n; } }
+  return bs >= 0.6 ? best : null;
+}
+const cleanCaption = (cap, raw, name) => { let c = String(cap || ''); for (const x of [raw, name].filter(Boolean)) c = c.replace(new RegExp(x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig'), '').trim(); c = c.replace(/^[\s,:;—–-]+|[\s,:;—–-]+$/g, '').replace(/\s{2,}/g, ' '); return c ? c[0].toUpperCase() + c.slice(1) : c; };
+const rosterLine = job => (job.roster || []).length ? `\nPlayers in this game (if you name a player, use the EXACT spelling from this list, otherwise null): ${job.roster.join(', ')}.` : '';
 const parseJson = t => { try { return JSON.parse(String(t).replace(/^\s*```(json)?|```\s*$/g, '').trim()); } catch { return null; } };
 const tSec = v => { if (typeof v === 'number') return v; const m = String(v || '').trim().split(':').map(Number); return m.some(isNaN) ? NaN : m.reduce((a, x) => a * 60 + x, 0); };
 const FONT = process.env.FONT || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
@@ -106,7 +121,7 @@ async function judge(file, ctx) {
   const data = (await fsp.readFile(fs.existsSync(small) ? small : file)).toString('base64');
   const prompt = `This is a ~24 second clip from a stream of an NBA 2K Pro-Am game (${ctx.team1} vs ${ctx.team2}). The camera follows one player. Voices on the stream are the players' team voice chat and may be in ANY language (Polish, Finnish, Turkish, Romanian, English…) — loud excited voices are a hint that something big happened, but judge mainly by what you SEE.
 Rate how highlight-worthy the best play in the clip is, 0–10. Be strict and use the whole scale: 9–10 = poster dunk, game winner, buzzer beater, ankle breaker + score, chase-down block; 7–8 = clean dunk, deep/contested three, alley-oop, great block, steal + fast-break finish, and-one; 5–6 = nice layup, open three, good pass; 2–4 = ordinary possession, missed shot; 0–1 = nothing happening, menus, replays, loading screens, free throws, timeouts.
-Reply with JSON only: {"score": number, "type": "dunk|three|block|steal|alleyoop|layup|assist|other|none", "caption": "${ctx.lang === 'pl' ? 'krótki podpis akcji po polsku, max 55 znaków, bez emoji' : 'short caption of the play in English, max 55 chars, no emoji'}", "player": "gamertag of the player who made the play if readable on screen, else null", "start": seconds, "end": seconds} — start/end = the best 8–14 s within the clip: include the build-up and the finish, end 1–2 s after the ball goes in or the play ends.`;
+Reply with JSON only: {"score": number, "type": "dunk|three|block|steal|alleyoop|layup|assist|other|none", "caption": "${ctx.lang === 'pl' ? 'krótki opis samej akcji po polsku, max 50 znaków, bez emoji i BEZ nicku gracza' : 'short description of the play itself in English, max 50 chars, no emoji and WITHOUT the player name'}", "player": "gamertag of the player who made the play if readable on screen, else null", "start": seconds, "end": seconds}${rosterLine(ctx)} — start/end = the best 8–14 s within the clip: include the build-up and the finish, end 1–2 s after the ball goes in or the play ends.`;
   const t = await gemGenerate([{ inline_data: { mime_type: 'video/mp4', data } }, { text: prompt }]); await fsp.unlink(small).catch(() => {});
   const o = t && parseJson(t); if (!o) return null;
   return { score: +o.score || 0, type: o.type || 'other', caption: String(o.caption || '').slice(0, 60), player: o.player && o.player !== 'null' ? String(o.player).slice(0, 30) : null, start: +o.start || 0, end: +o.end || 0 };
@@ -133,12 +148,14 @@ async function scanGame(url, from, to, dir, ctx, tag) {
   const mins = Math.round((to - from) / 60);
   const prompt = `This video is a full ${mins}-minute recording of an NBA 2K Pro-Am game stream (${ctx.team1} vs ${ctx.team2}); the camera follows one player. Voice chat may be in any language — use it only as a hint.
 Find the 15 BEST highlight plays of the whole game (dunks, deep or clutch threes, alley-oops, blocks, steals that lead to a score, ankle breakers, and-ones, game-winners). Skip lobby, menus, loading screens, replays, free throws and dead balls. Spread them across the game, do not list the same play twice.
-Reply with JSON only: an array of {"time": "MM:SS" (the moment the ball goes in / the play ends, measured from the START OF THIS VIDEO), "score": 0-10, "type": "dunk|three|block|steal|alleyoop|layup|assist|other", "caption": "${ctx.lang === 'pl' ? 'krótki podpis po polsku, max 55 znaków' : 'short caption in English, max 55 chars'}", "player": "gamertag if readable, else null"}, best first.`;
+Also find the moment when the FINAL box score / end-of-game stats screen is shown (after the final buzzer).
+Reply with JSON only: {"plays": [ {"time": "MM:SS" (the moment the ball goes in / the play ends, measured from the START OF THIS VIDEO), "score": 0-10, "type": "dunk|three|block|steal|alleyoop|layup|assist|other", "caption": "${ctx.lang === 'pl' ? 'krótki opis akcji po polsku, max 50 znaków, bez nicku' : 'short description of the play in English, max 50 chars, without the player name'}", "player": "gamertag if readable, else null"} ], "boxscore": "MM:SS" or null} — plays best first.${rosterLine(ctx)}`;
   for (const key of GKEYS) { let f = null;
     try {
       f = await gemUpload(low, key);
       const t = await gemGenerate([{ file_data: { mime_type: 'video/mp4', file_uri: f.uri } }, { text: prompt }], { keys: [key], timeout: 240e3, budget: 600e3, cfg: { mediaResolution: 'MEDIA_RESOLUTION_LOW' } });
-      const arr = t && parseJson(t);
+      const o = t && parseJson(t), arr = Array.isArray(o) ? o : o?.plays;
+      if (o && !Array.isArray(o) && o.boxscore && isFinite(tSec(o.boxscore))) scanGame.box = { [tag]: from + tSec(o.boxscore) };
       if (Array.isArray(arr)) return arr.map(x => ({ t: from + tSec(x.time ?? x.t), score: +x.score || 0, type: x.type || 'other', caption: String(x.caption || '').slice(0, 60), player: x.player && x.player !== 'null' ? String(x.player).slice(0, 30) : null })).filter(x => isFinite(x.t) && x.t >= from && x.t <= to);
     } catch (e) { log('scan:', e.message); }
     finally { if (f?.name) fetch(`https://generativelanguage.googleapis.com/v1beta/${f.name}?key=${key}`, { method: 'DELETE' }).catch(() => {}); }
@@ -162,8 +179,20 @@ async function card(dir, name, lines, secs) { // plansza: lista [tekst, rozmiar,
 async function part(dir, i, seg, a, b, caption, top) {
   const cf = await txt(dir, `cap${i}`, caption), tf = await txt(dir, `top${i}`, top), out = path.join(dir, `part${i}.mp4`), d = b - a;
   const vf = `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,`
-    + `drawbox=x=0:y=ih-92:w=iw:h=92:color=black@0.55:t=fill,${dt(cf, 34, 40, 'h-70')},${dt(tf, 22, 40, 26, ':box=1:boxcolor=black@0.45:boxborderw=10')},fade=t=in:st=0:d=0.25,fade=t=out:st=${(d - 0.25).toFixed(2)}:d=0.25`;
+    + (caption ? `drawbox=x=0:y=ih-92:w=iw:h=92:color=black@0.55:t=fill,${dt(cf, 34, 40, 'h-70')},${dt(tf, 22, 40, 26, ':box=1:boxcolor=black@0.45:boxborderw=10')},` : '')
+    + `fade=t=in:st=0:d=0.25,fade=t=out:st=${(d - 0.25).toFixed(2)}:d=0.25`;
   await run('ffmpeg', ['-y', '-ss', a.toFixed(2), '-to', b.toFixed(2), '-i', seg, '-vf', vf, '-af', `afade=t=in:st=0:d=0.25,afade=t=out:st=${(d - 0.3).toFixed(2)}:d=0.3`, ...V, out]);
+  return out;
+}
+async function boxCard(dir, box, job, secs) { // 📊 tabela statystyk z danych ligi (gdy na nagraniu nie ma ekranu statystyk)
+  const files = [], vf = [], add = async (s, size, x, y, col = 'white') => { const f = await txt(dir, 'bx' + files.length, s); files.push(f); vf.push(dt(f, size, x, y, `:fontcolor=${col}`)); };
+  await add(job.lang === 'pl' ? 'STATYSTYKI MECZU' : 'FINAL BOX SCORE', 26, '(w-text_w)/2', 40, '0xf5c518');
+  for (const [ci, t] of [box.t1, box.t2].entries()) { const x0 = ci ? 680 : 60;
+    await add(`${t.name}  ${t.score}`, 30, x0, 100);
+    await add('PTS  REB  AST', 18, x0 + 330, 150, '0x9aa4bf');
+    for (const [i, p] of (t.players || []).entries()) { const y = 185 + i * 48; await add(p.n, 24, x0, y); await add(`${String(p.pts).padStart(3)}  ${String(p.reb).padStart(3)}  ${String(p.ast).padStart(3)}`, 24, x0 + 330, y); } }
+  const out = path.join(dir, 'boxcard.mp4');
+  await run('ffmpeg', ['-y', '-f', 'lavfi', '-i', `color=c=0x0b1020:s=1280x720:d=${secs}:r=30`, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', String(secs), '-vf', `drawbox=x=640:y=95:w=2:h=520:color=0x334155:t=fill,${vf.join(',')},fade=t=in:st=0:d=0.4,fade=t=out:st=${secs - 0.4}:d=0.4`, ...V, '-shortest', out]);
   return out;
 }
 async function concat(dir, files, out) { const lst = path.join(dir, path.basename(out) + '.txt'); await fsp.writeFile(lst, files.map(f => `file '${f}'`).join('\n')); await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', '-movflags', '+faststart', out]); return out; }
@@ -178,7 +207,7 @@ async function processJob(job, opts = {}) {
   const brand = job.league === 'eu' ? 'EU CHEMIK LEAGUE' : '2K PRO-AM EKSTRAKLASA', site = job.league === 'eu' ? 'eu.chemikleagues.com' : 'chemikleagues.com';
   const stats = { candidates: 0, judged: 0, streams: 0 };
   try {
-    const gameLen = Math.max(1, job.bestOf || 1) * 75 * 60 + 20 * 60, plays = [];
+    const gameLen = Math.max(1, job.bestOf || 1) * 75 * 60 + 20 * 60, plays = []; let boxAt = null;
     for (const [si, s] of (job.streams || []).entries()) {
       const off = ms => (ms - s.created) / 1000, vodLen = (s.dur || 4 * 36e5) / 1000;
       const from = Math.max(0, off(job.start) - 300), to = Math.min(vodLen, from + gameLen);
@@ -191,7 +220,8 @@ async function processJob(job, opts = {}) {
       C.forEach(c => { c.fan = c.w; });
       try { const db = await loudness(s.url, from, to, dir); audioPeaks(db, from, 10).forEach(p => C.push({ t: p.t - 2, w: Math.min(3, p.w) })); } catch (e) { log('audio:', e.message); }
       progress(job, pl ? '🧠 Gemini ogląda cały mecz i wybiera najlepsze akcje' : '🧠 Gemini is watching the whole game and picking the best plays');
-      try { const sc = await scanGame(s.url, from, to, dir, job, si); stats.scanned = (stats.scanned || 0) + sc.length; sc.forEach(x => C.push({ t: x.t, w: 2 + x.score, scan: x })); } catch (e) { log('scan:', e.message); }
+      try { scanGame.box = null; const sc = await scanGame(s.url, from, to, dir, job, si); stats.scanned = (stats.scanned || 0) + sc.length; sc.forEach(x => C.push({ t: x.t, w: 2 + x.score, scan: x }));
+        if (scanGame.box?.[si] && !boxAt) boxAt = { url: s.url, t: scanGame.box[si], vodLen }; } catch (e) { log('scan:', e.message); }
       const M = []; C.filter(c => c.t > from && c.t < to).sort((a, b) => a.t - b.t).forEach(c => { const l = M[M.length - 1]; if (l && c.t - l.t < 15) { l.w += c.w; l.fan = (l.fan || 0) + (c.fan || 0); if (c.scan && (!l.scan || c.scan.score > l.scan.score)) l.scan = c.scan; if (c.w > l.top) { l.t = c.t; l.top = c.w; } } else M.push({ ...c, top: c.w }); });
       const pick = M.sort((a, b) => b.w - a.w).slice(0, opts.maxCand || (job.streams.length > 1 ? 12 : 18)); stats.candidates += pick.length;
       for (const [ci, c] of pick.entries()) {
@@ -202,7 +232,7 @@ async function processJob(job, opts = {}) {
         if (!j && c.scan) j = { ...c.scan, start: mid - 10, end: mid + 2 }; // ocena z przeglądu całego meczu
         if (!j) j = { score: Math.min(6, 2 + c.w / 2), type: 'other', caption: pl ? 'Akcja meczu' : 'Big play', player: null, start: mid - 10, end: mid + 2, weak: true };
         let st = Math.max(0, Math.min(j.start, seglen - 6)), en = Math.min(seglen, Math.max(j.end, st + 8)); if (en - st > 15) st = en - 15;
-        plays.push({ seg, seglen, a: st, b: en, abs: s.created + (a + st) * 1000, score: j.score + Math.min(1.5, (c.fan || 0) / 4) + (c.scan && !j.weak ? 0.5 : 0), type: j.type, caption: j.caption || (c.scan?.caption) || (pl ? 'Akcja meczu' : 'Big play'), player: j.player || c.scan?.player || null, team: s.team, login: s.login });
+        plays.push({ seg, seglen, a: st, b: en, abs: s.created + (a + st) * 1000, score: j.score + Math.min(1.5, (c.fan || 0) / 4) + (c.scan && !j.weak ? 0.5 : 0), type: j.type, ...(() => { const raw = j.player || c.scan?.player || null, nm = matchName(raw, job.roster); return { player: nm, caption: cleanCaption(j.caption || c.scan?.caption, raw, nm) || (pl ? 'Akcja meczu' : 'Big play') }; })(), team: s.team, login: s.login });
       }
     }
     // to samo z dwóch transmisji (±12 s) → zostaje lepiej oceniona
@@ -217,7 +247,13 @@ async function processJob(job, opts = {}) {
     const score = (job.games || []).map(g => `${g.s1} : ${g.s2}`).join('   ·   ');
     const top = `${job.team1} vs ${job.team2}${job.week ? `  ·  WEEK ${job.week}` : ''}`;
     const parts = [await card(dir, 'intro', [[brand, 30, '0xf5c518'], [`${job.team1}  vs  ${job.team2}`, 54], ...(score ? [[score, 44]] : []), [`${job.week ? `WEEK ${job.week}  ·  ` : ''}HIGHLIGHTS`, 26, '0x9aa4bf']], 3)];
-    for (const [i, p] of best.entries()) parts.push(await part(dir, i, p.seg, p.a, p.b, `${p.caption}${p.player ? '  —  ' + p.player : ''}`, top));
+    for (const [i, p] of best.entries()) parts.push(await part(dir, i, p.seg, p.a, p.b, `${p.caption}${p.player && !p.caption.toLowerCase().includes(p.player.toLowerCase()) ? '  —  ' + p.player : ''}`, top));
+    progress(job, pl ? '📊 Tabela statystyk na koniec' : '📊 Box score at the end');
+    let boxPart = null;
+    if (boxAt) try { const seg = path.join(dir, 'boxseg.mp4'), a = Math.max(0, boxAt.t - 0.5); await getSegment(boxAt.url, a, Math.min(boxAt.vodLen, a + 5), seg);
+      const d = await probeDur(seg); if (d >= 3) boxPart = await part(dir, 'box', seg, 0, Math.min(4.5, d), '', top); /* ekran statystyk z gry — bez paska z podpisem */ } catch (e) { log('box:', e.message); }
+    if (!boxPart && (job.box || []).length) boxPart = await boxCard(dir, job.box[job.box.length - 1], job, 5).catch(e => { log('boxcard:', e.message); return null; });
+    if (boxPart) parts.push(boxPart);
     parts.push(await card(dir, 'outro', [[brand, 34, '0xf5c518'], [site, 28]], 2.5));
     const wide = await concat(dir, parts, path.join(dir, 'wide.mp4')), vert = await vertical(wide, path.join(dir, 'vertical.mp4'));
     const result = { ok: true, scheduleId: job.scheduleId, plays: best.map(p => ({ caption: p.caption, player: p.player, type: p.type, score: Math.round(p.score * 10) / 10, team: p.team, at: new Date(p.abs).toISOString() })), stats: { ...stats, seconds: Math.round((Date.now() - t0) / 1000), length: Math.round(await probeDur(wide)) } };
